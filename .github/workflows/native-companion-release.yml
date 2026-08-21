@@ -66,7 +66,7 @@ jobs:
             runner: windows-latest
             build_command: npm run build:win --prefix source/connector-app -- --publish never
           - platform: macos
-            runner: macos-13
+            runner: macos-15-intel
             build_command: npm run build:mac --prefix source/connector-app -- --universal --publish never
           - platform: linux
             runner: ubuntu-latest
