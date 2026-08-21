@@ -64,13 +64,13 @@ jobs:
         include:
           - platform: windows
             runner: windows-latest
-            build_command: npm run build:win --prefix source/connector-app
+            build_command: npm run build:win --prefix source/connector-app -- --publish never
           - platform: macos
             runner: macos-13
-            build_command: npm run build:mac --prefix source/connector-app -- --universal
+            build_command: npm run build:mac --prefix source/connector-app -- --universal --publish never
           - platform: linux
             runner: ubuntu-latest
-            build_command: npm run build:linux --prefix source/connector-app -- --x64
+            build_command: npm run build:linux --prefix source/connector-app -- AppImage --x64 --publish never
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Check out exact private source
