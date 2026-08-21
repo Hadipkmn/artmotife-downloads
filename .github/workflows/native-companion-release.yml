@@ -90,6 +90,14 @@ jobs:
         run: npm ci --prefix source/connector-app
       - name: Build native Connector package
         run: ${{ matrix.build_command }}
+      - name: Normalize Linux architecture label
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          version="${{ needs.preflight.outputs.connector_version }}"
+          mv \
+            "source/connector-app/dist/ArtMotife-Connector-${version}-linux-x86_64.AppImage" \
+            "source/connector-app/dist/ArtMotife-Connector-${version}-linux-x64.AppImage"
       - name: Prepare immutable artifact and stable latest alias
         run: >-
           node source/scripts/prepare-companion-release-assets.mjs
