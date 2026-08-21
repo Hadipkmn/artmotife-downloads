@@ -88,6 +88,10 @@ jobs:
           cache-dependency-path: source/connector-app/package-lock.json
       - name: Install Connector dependencies
         run: npm ci --prefix source/connector-app
+      - name: Normalize macOS package icon
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: sips -z 512 512 source/connector-app/assets/icon.png --out source/connector-app/assets/icon.png
       - name: Build native Connector package
         run: ${{ matrix.build_command }}
       - name: Normalize Linux architecture label
