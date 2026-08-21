@@ -1,0 +1,172 @@
+name: Native companion release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact private source commit or reviewed ref
+        required: true
+        default: main
+  schedule:
+    - cron: '17 */6 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: native-companion-release
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.release.outputs.source_sha }}
+      connector_version: ${{ steps.release.outputs.connector_version }}
+      collector_version: ${{ steps.release.outputs.collector_version }}
+      tag: ${{ steps.release.outputs.tag }}
+      should_publish: ${{ steps.release.outputs.should_publish }}
+    steps:
+      - name: Check out reviewed private source
+        uses: actions/checkout@v4
+        with:
+          repository: Hadipkmn/artmotife-private
+          ref: ${{ inputs.source_ref || 'main' }}
+          ssh-key: ${{ secrets.ARTMOTIFE_PRIVATE_SOURCE_KEY }}
+          persist-credentials: false
+          path: source
+      - name: Resolve exact release identity
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          source_sha="$(git -C source rev-parse HEAD)"
+          connector_version="$(node -p "require('./source/connector-app/package.json').version")"
+          collector_version="$(node -p "require('./source/collector-extension/manifest.json').version")"
+          tag="connector-v${connector_version}-collector-v${collector_version}"
+          should_publish=true
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            should_publish=false
+          fi
+          echo "source_sha=${source_sha}" >> "$GITHUB_OUTPUT"
+          echo "connector_version=${connector_version}" >> "$GITHUB_OUTPUT"
+          echo "collector_version=${collector_version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "should_publish=${should_publish}" >> "$GITHUB_OUTPUT"
+
+  build-connector:
+    needs: preflight
+    if: needs.preflight.outputs.should_publish == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows
+            runner: windows-latest
+            build_command: npm run build:win --prefix source/connector-app
+          - platform: macos
+            runner: macos-13
+            build_command: npm run build:mac --prefix source/connector-app -- --universal
+          - platform: linux
+            runner: ubuntu-latest
+            build_command: npm run build:linux --prefix source/connector-app -- --x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out exact private source
+        uses: actions/checkout@v4
+        with:
+          repository: Hadipkmn/artmotife-private
+          ref: ${{ needs.preflight.outputs.source_sha }}
+          ssh-key: ${{ secrets.ARTMOTIFE_PRIVATE_SOURCE_KEY }}
+          persist-credentials: false
+          path: source
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: source/connector-app/package-lock.json
+      - name: Install Connector dependencies
+        run: npm ci --prefix source/connector-app
+      - name: Build native Connector package
+        run: ${{ matrix.build_command }}
+      - name: Prepare immutable artifact and stable latest alias
+        run: >-
+          node source/scripts/prepare-companion-release-assets.mjs
+          --platform ${{ matrix.platform }}
+          --source connector-app/dist
+          --output ../release-assets/${{ matrix.platform }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: companion-${{ matrix.platform }}
+          path: release-assets/${{ matrix.platform }}/*
+          if-no-files-found: error
+          retention-days: 14
+
+  build-collector:
+    needs: preflight
+    if: needs.preflight.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out exact private source
+        uses: actions/checkout@v4
+        with:
+          repository: Hadipkmn/artmotife-private
+          ref: ${{ needs.preflight.outputs.source_sha }}
+          ssh-key: ${{ secrets.ARTMOTIFE_PRIVATE_SOURCE_KEY }}
+          persist-credentials: false
+          path: source
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: source/ui/package-lock.json
+      - name: Install Studio packaging dependencies
+        run: npm ci --prefix source/ui
+      - name: Build versioned Collector package
+        run: node source/ui/scripts/package-collector-extension.mjs
+      - name: Prepare immutable package and stable latest alias
+        run: >-
+          node source/scripts/prepare-companion-release-assets.mjs
+          --platform collector
+          --source ui/public/downloads
+          --output ../release-assets/collector
+      - uses: actions/upload-artifact@v4
+        with:
+          name: companion-collector
+          path: release-assets/collector/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: [preflight, build-connector, build-collector]
+    if: needs.preflight.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: companion-*
+          path: release-assets
+          merge-multiple: true
+      - name: Bind complete native release manifest
+        env:
+          SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+        shell: bash
+        run: |
+          jq -s --arg sourceCommit "$SOURCE_SHA" \
+            '{schemaVersion: 1, sourceCommit: $sourceCommit, platforms: .}' \
+            release-assets/release-manifest-*.json > release-assets/companion-release-manifest.json
+      - name: Publish exact release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          CONNECTOR_VERSION: ${{ needs.preflight.outputs.connector_version }}
+          COLLECTOR_VERSION: ${{ needs.preflight.outputs.collector_version }}
+          SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+        shell: bash
+        run: |
+          gh release create "$RELEASE_TAG" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "ArtMotife Connector ${CONNECTOR_VERSION} · Collector ${COLLECTOR_VERSION}" \
+            --notes "Native companion release from reviewed private source commit ${SOURCE_SHA}. Includes immutable versioned files, stable latest aliases, checksums, updater metadata, and a combined release manifest." \
+            --latest
