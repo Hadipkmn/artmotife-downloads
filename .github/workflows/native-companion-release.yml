@@ -177,8 +177,17 @@ jobs:
           SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
         shell: bash
         run: |
-          gh release create "$RELEASE_TAG" release-assets/* \
+          gh release create "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --title "ArtMotife Connector ${CONNECTOR_VERSION} · Collector ${COLLECTOR_VERSION}" \
             --notes "Native companion release from reviewed private source commit ${SOURCE_SHA}. Includes immutable versioned files, stable latest aliases, checksums, updater metadata, and a combined release manifest." \
             --latest
+          if ! gh release upload "$RELEASE_TAG" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber; then
+            gh release delete "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --cleanup-tag \
+              --yes
+            exit 1
+          fi
