@@ -13,6 +13,9 @@ on:
 permissions:
   contents: write
 
+env:
+  ARTMOTIFE_PRIMARY_REPOSITORY: ${{ github.workspace }}/source
+
 concurrency:
   group: native-companion-release
   cancel-in-progress: false
