@@ -1,0 +1,187 @@
+# Manual qualification may run before release; all native gates below must pass
+# on the exact source before the dependent publish job can promote any feed.
+# Manual, exact-source, dedicated component release; never changes core latest.yml.
+name: Qualified Connector component release
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Reviewed full private source commit (40 lowercase hex characters)
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: connector-component-release
+  cancel-in-progress: false
+env:
+  ARTMOTIFE_PRIMARY_REPOSITORY: ${{ github.workspace }}/source
+  ARTMOTIFE_QUALIFICATION_SOURCE_COMMIT: ${{ inputs.source_sha }}
+jobs:
+  qualify-and-sign:
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+            command: npm run build:win -- --publish never
+          - os: ubuntu-latest
+            platform: linux
+            command: npm run build:linux -- AppImage --x64 --publish never
+          - os: macos-15-intel
+            platform: macos
+            command: npm run build:mac -- --universal --publish never
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Require immutable source
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: '[[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]'
+      - name: Reserve disposable Linux build scratch
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          test "$GITHUB_ACTIONS" = true
+          sudo rm -rf -- /usr/local/lib/android
+      - uses: actions/checkout@v4
+        with:
+          repository: Hadipkmn/artmotife-private
+          ref: ${{ inputs.source_sha }}
+          ssh-key: ${{ secrets.ARTMOTIFE_PRIVATE_SOURCE_KEY }}
+          persist-credentials: false
+          path: source
+          sparse-checkout: |
+            connector-app
+            connector
+            ui/shared
+            ui/server
+            ui/src/services
+            ui/vendor/edit-studio-scripting
+            ui/vendor/edit-studios
+            comfyui-artmotife-bridge
+            comfyui-artmotife-assets
+            collector-extension
+            scripts
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --prefix source/connector-app
+      - run: npm run test:components --prefix source/connector-app
+      - name: Normalize macOS package icon
+        if: matrix.platform == 'macos'
+        run: sips -z 512 512 source/connector-app/assets/icon.png --out source/connector-app/assets/icon.png
+      - name: Build through native release gates
+        working-directory: source/connector-app
+        run: ${{ matrix.command }}
+      - name: Complete Windows regression on the exact release source
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $fixtureTemp = (node -e "const fs=require('fs');console.log((fs.realpathSync.native||fs.realpathSync)(require('os').tmpdir()))").Trim()
+          $env:TEMP = $fixtureTemp
+          $env:TMP = $fixtureTemp
+          npm ci --omit=dev --ignore-scripts --prefix source/ui
+          if ($LASTEXITCODE -ne 0) { throw 'Regression dependencies failed' }
+          node --test source/connector/projectMetadataListsService.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Project metadata regression failed' }
+          npm test --prefix source/connector-app
+          if ($LASTEXITCODE -ne 0) { throw 'Full Connector regression failed' }
+      - name: Windows real installer and component qualification
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $version = (Get-Content source/connector-app/package.json -Raw | ConvertFrom-Json).version
+          ./source/connector-app/qualifyWindowsInstaller.ps1 -Candidate "./source/connector-app/dist/ArtMotife-Connector-$version-windows-x64.exe"
+      - name: Linux final artifact and component qualification
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          scratch="$(mktemp -d "$RUNNER_TEMP/artmotife-final-XXXXXX")"
+          cd "$scratch"
+          image="$(find "$GITHUB_WORKSPACE/source/connector-app/dist" -maxdepth 1 -name '*.AppImage' -print -quit)"
+          test -n "$image"
+          "$image" --appimage-extract > extraction.log
+          node "$GITHUB_WORKSPACE/source/connector-app/qualifyExtractedComponentArtifact.cjs" "$scratch/squashfs-root/resources" "$GITHUB_WORKSPACE/source/connector-app/dist/linux-final-artifact.json"
+          node "$GITHUB_WORKSPACE/source/connector-app/qualifyComponentPayload.cjs" "$scratch/squashfs-root/resources" "$RUNNER_TEMP/qualification-linux"
+          cp "$RUNNER_TEMP/qualification-linux/receipt.json" "$GITHUB_WORKSPACE/source/connector-app/dist/linux-component-qualification.json"
+      - name: macOS final artifact and component qualification
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          mount="$(mktemp -d "$RUNNER_TEMP/artmotife-final-XXXXXX")"
+          dmg="$(find source/connector-app/dist -maxdepth 1 -name '*.dmg' -print -quit)"
+          test -n "$dmg"
+          hdiutil attach -quiet -readonly -nobrowse -mountpoint "$mount" "$dmg"
+          node source/connector-app/qualifyExtractedComponentArtifact.cjs "$mount/ArtMotife Connector.app/Contents/Resources" "$GITHUB_WORKSPACE/source/connector-app/dist/macos-final-artifact.json"
+          node source/connector-app/qualifyComponentPayload.cjs "$mount/ArtMotife Connector.app/Contents/Resources" "$RUNNER_TEMP/qualification-macos"
+          cp "$RUNNER_TEMP/qualification-macos/receipt.json" "$GITHUB_WORKSPACE/source/connector-app/dist/macos-component-qualification.json"
+          # Keep the tested readonly volume mounted through signing; runner
+          # teardown disposes it. Signing rechecks the exact resource path.
+      - name: Sign only matching qualified resources
+        env:
+          ARTMOTIFE_COMPONENT_SIGNING_KEY: ${{ secrets.ARTMOTIFE_COMPONENT_SIGNING_KEY }}
+        run: node source/connector-app/prepareComponentPlatform.cjs ${{ matrix.platform }} source/connector-app/dist source/component-output
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-components-${{ matrix.platform }}
+          path: |
+            source/component-output/*.ampkg
+            source/component-output/*.release.json
+            source/component-output/publication-entry.json
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qualified-core-${{ matrix.platform }}
+          path: |
+            source/connector-app/dist/*.exe
+            source/connector-app/dist/*.dmg
+            source/connector-app/dist/*.zip
+            source/connector-app/dist/*.AppImage
+            source/connector-app/dist/*.blockmap
+            source/connector-app/dist/*.yml
+            source/connector-app/dist/*qualification.json
+            source/connector-app/dist/*-final-artifact.json*
+          if-no-files-found: error
+          retention-days: 7
+  publish-components:
+    needs: qualify-and-sign
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Hadipkmn/artmotife-private
+          ref: ${{ inputs.source_sha }}
+          ssh-key: ${{ secrets.ARTMOTIFE_PRIVATE_SOURCE_KEY }}
+          persist-credentials: false
+          path: source
+          sparse-checkout: connector-app
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-components-*
+          path: candidates
+      - name: Resolve portable package inputs
+        run: |
+          node <<'NODE'
+          const fs=require('node:fs'),path=require('node:path');
+          const entries=['windows','linux','macos'].map(label=>{
+            const directory=path.resolve('candidates/release-components-'+label);
+            const item=JSON.parse(fs.readFileSync(path.join(directory,'publication-entry.json')));
+            if(path.basename(item.manifest)!==item.manifest)throw new Error('Invalid manifest path');
+            return {...item,directory,manifest:path.join(directory,item.manifest)};
+          });
+          fs.writeFileSync('publication-inputs.json',JSON.stringify(entries));
+          NODE
+      - name: Verify assets and atomically promote component feeds
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node source/connector-app/publishComponentFeed.cjs publication-inputs.json
