@@ -7,11 +7,18 @@ on:
         description: Exact private source commit or reviewed ref
         required: true
         default: main
+      qualification_run_id:
+        description: Optional successful component qualification run to promote without rebuilding
+        required: false
+      tooling_sha:
+        description: Exact reviewed release-tooling commit for qualified promotion
+        required: false
   schedule:
     - cron: '17 */6 * * *'
 
 permissions:
   contents: write
+  actions: read
 
 env:
   ARTMOTIFE_PRIMARY_REPOSITORY: ${{ github.workspace }}/source
@@ -21,7 +28,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  promote-qualified:
+    if: ${{ inputs.qualification_run_id != '' }}
+    uses: ./.github/workflows/promote-qualified-core.yml
+    with:
+      source_sha: ${{ inputs.source_ref }}
+      tooling_sha: ${{ inputs.tooling_sha }}
+      qualification_run_id: ${{ inputs.qualification_run_id }}
+    secrets: inherit
   preflight:
+    if: ${{ !inputs.qualification_run_id }}
     runs-on: ubuntu-latest
     outputs:
       source_sha: ${{ steps.release.outputs.source_sha }}
@@ -51,6 +67,10 @@ jobs:
           should_publish=true
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             should_publish=false
+          fi
+          if [ "$should_publish" = true ]; then
+            echo 'New Connector releases require qualification_run_id and pinned tooling_sha; unqualified rebuild publication is disabled.'
+            exit 1
           fi
           echo "source_sha=${source_sha}" >> "$GITHUB_OUTPUT"
           echo "connector_version=${connector_version}" >> "$GITHUB_OUTPUT"

@@ -1,0 +1,183 @@
+name: Promote exact qualified Connector artifacts
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        type: string
+        required: true
+      tooling_sha:
+        type: string
+        required: true
+      qualification_run_id:
+        type: string
+        required: true
+    secrets:
+      ARTMOTIFE_PRIVATE_SOURCE_KEY:
+        required: true
+permissions:
+  contents: write
+  actions: read
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 140
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+    steps:
+      - name: Require pinned source, tooling and run
+        env:
+          SOURCE: ${{ inputs.source_sha }}
+          TOOLING: ${{ inputs.tooling_sha }}
+          RUN_ID: ${{ inputs.qualification_run_id }}
+        run: |
+          [[ "$SOURCE" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$TOOLING" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]]
+      - uses: actions/checkout@v4
+        with:
+          repository: Hadipkmn/artmotife-private
+          ref: ${{ inputs.tooling_sha }}
+          ssh-key: ${{ secrets.ARTMOTIFE_PRIVATE_SOURCE_KEY }}
+          persist-credentials: false
+          path: tooling
+          sparse-checkout: |
+            scripts
+            connector-app
+      - uses: actions/checkout@v4
+        with:
+          repository: Hadipkmn/artmotife-private
+          ref: ${{ inputs.source_sha }}
+          ssh-key: ${{ secrets.ARTMOTIFE_PRIVATE_SOURCE_KEY }}
+          persist-credentials: false
+          path: candidate
+          sparse-checkout: connector-app/package.json
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Read exact candidate version
+        id: identity
+        run: echo "version=$(node -p "require('./candidate/connector-app/package.json').version")" >> "$GITHUB_OUTPUT"
+      - name: Wait for all native qualification and signed feeds
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.qualification_run_id }}
+        run: |
+          for attempt in $(seq 1 130); do
+            state=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" --jq .status)
+            if [ "$state" = completed ]; then
+              node tooling/scripts/promote-qualified-connector.mjs gate "$RUN_ID"
+              exit 0
+            fi
+            echo "Qualification still running; stable release is unchanged."
+            sleep 60
+          done
+          echo 'Qualification not complete; refusing publication.'
+          exit 1
+  prepare:
+    needs: gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows
+            os: ubuntu-latest
+          - platform: linux
+            os: ubuntu-latest
+          - platform: macos
+            os: macos-15-intel
+          - platform: collector
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Hadipkmn/artmotife-private
+          ref: ${{ inputs.tooling_sha }}
+          ssh-key: ${{ secrets.ARTMOTIFE_PRIVATE_SOURCE_KEY }}
+          persist-credentials: false
+          path: tooling
+          sparse-checkout: |
+            scripts
+            connector-app
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        if: matrix.platform != 'collector'
+        with:
+          name: qualified-core-${{ matrix.platform }}
+          run-id: ${{ inputs.qualification_run_id }}
+          github-token: ${{ github.token }}
+          path: candidate
+      - name: Verify exact qualification evidence
+        if: matrix.platform != 'collector'
+        env:
+          SOURCE: ${{ inputs.source_sha }}
+          VERSION: ${{ needs.gate.outputs.version }}
+          PLATFORM: ${{ matrix.platform }}
+        run: node tooling/scripts/verify-qualified-core.mjs candidate "$PLATFORM" "$SOURCE" "$VERSION"
+      - name: Verify macOS updater ZIP against qualified DMG
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          mount=$(mktemp -d "$RUNNER_TEMP/artmotife-parity-XXXXXX")
+          dmg=$(find candidate -maxdepth 1 -name '*.dmg' -print -quit)
+          zip=$(find candidate -maxdepth 1 -name '*.zip' -print -quit)
+          test -n "$dmg" && test -n "$zip"
+          hdiutil attach -quiet -readonly -nobrowse -mountpoint "$mount" "$dmg"
+          trap 'hdiutil detach -quiet "$mount"' EXIT
+          python3 tooling/scripts/verify-mac-update-parity.py "$zip" "$mount/ArtMotife Connector.app"
+      - name: Reuse immutable published Collector bytes
+        if: matrix.platform == 'collector'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node tooling/scripts/promote-qualified-connector.mjs collector candidate
+      - name: Validate metadata and stage only release payloads
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          if [ "$PLATFORM" != collector ]; then
+            npm ci --ignore-scripts --prefix tooling/connector-app
+          fi
+          if [ "$PLATFORM" = windows ]; then
+            test -s "candidate/ArtMotife-Connector-${{ needs.gate.outputs.version }}-windows-x64.exe.blockmap"
+          fi
+          node tooling/scripts/prepare-companion-release-assets.mjs --platform "$PLATFORM" --source ../candidate --output ../release-assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: promoted-${{ matrix.platform }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+  publish:
+    needs: [gate, prepare]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Hadipkmn/artmotife-private
+          ref: ${{ inputs.tooling_sha }}
+          ssh-key: ${{ secrets.ARTMOTIFE_PRIVATE_SOURCE_KEY }}
+          persist-credentials: false
+          path: tooling
+          sparse-checkout: |
+            scripts
+            connector-app
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: promoted-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify draft assets before advertising new installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE: ${{ inputs.source_sha }}
+          VERSION: ${{ needs.gate.outputs.version }}
+          RUN_ID: ${{ inputs.qualification_run_id }}
+        run: node tooling/scripts/promote-qualified-connector.mjs publish release-assets "$SOURCE" "$VERSION" "$RUN_ID"
