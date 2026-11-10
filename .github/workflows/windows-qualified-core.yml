@@ -1,0 +1,145 @@
+name: Qualified Windows Connector release
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact reviewed private source SHA on main
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: connector-component-release
+  cancel-in-progress: false
+env:
+  ARTMOTIFE_PRIMARY_REPOSITORY: ${{ github.workspace }}/source
+  ARTMOTIFE_QUALIFICATION_SOURCE_COMMIT: ${{ inputs.source_sha }}
+jobs:
+  qualify-and-sign:
+    timeout-minutes: 240
+    runs-on: windows-latest
+    steps:
+      - name: Require immutable source
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: '[[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]'
+
+      - uses: actions/checkout@v4
+        with:
+          repository: Hadipkmn/artmotife-private
+          ref: ${{ inputs.source_sha }}
+          ssh-key: ${{ secrets.ARTMOTIFE_PRIVATE_SOURCE_KEY }}
+          persist-credentials: false
+          path: source
+          sparse-checkout: |
+            connector-app
+            connector
+            ui/shared
+            ui/server
+            ui/src/services
+            ui/vendor/edit-studio-scripting
+            ui/vendor/edit-studios
+            comfyui-artmotife-bridge
+            comfyui-artmotife-assets
+            collector-extension
+            scripts
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --prefix source/connector-app
+      - run: npm run test:components --prefix source/connector-app
+
+      - name: Build through native release gates
+        working-directory: source/connector-app
+        run: npm run build:win -- --publish never
+      - name: Complete Windows regression on the exact release source
+        shell: pwsh
+        run: |
+          $fixtureTemp = (node -e "const fs=require('fs');console.log((fs.realpathSync.native||fs.realpathSync)(require('os').tmpdir()))").Trim()
+          $env:TEMP = $fixtureTemp
+          $env:TMP = $fixtureTemp
+          npm ci --omit=dev --ignore-scripts --prefix source/ui
+          if ($LASTEXITCODE -ne 0) { throw 'Regression dependencies failed' }
+          node --test source/connector/projectMetadataListsService.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Project metadata regression failed' }
+          npm test --prefix source/connector-app
+          if ($LASTEXITCODE -ne 0) { throw 'Full Connector regression failed' }
+      - name: Windows real installer and component qualification
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $version = (Get-Content source/connector-app/package.json -Raw | ConvertFrom-Json).version
+          ./source/connector-app/qualifyWindowsInstaller.ps1 -Candidate "./source/connector-app/dist/ArtMotife-Connector-$version-windows-x64.exe"
+
+
+      - name: Sign only matching qualified resources
+        env:
+          ARTMOTIFE_COMPONENT_SIGNING_KEY: ${{ secrets.ARTMOTIFE_COMPONENT_SIGNING_KEY }}
+        run: node source/connector-app/prepareComponentPlatform.cjs windows source/connector-app/dist source/component-output
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-components-windows
+          path: |
+            source/component-output/*.ampkg
+            source/component-output/*.release.json
+            source/component-output/publication-entry.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Bind qualification to the Windows updater files
+        shell: pwsh
+        run: |
+          $dist = 'source/connector-app/dist'
+          $files = Get-ChildItem -LiteralPath $dist -File | Where-Object { $_.Name -match '(\.exe|\.exe\.blockmap|^latest\.yml)$' }
+          if ($files.Count -ne 3) { throw 'Expected one installer, blockmap and updater metadata' }
+          $items = @($files | ForEach-Object { @{ name=$_.Name; size=$_.Length; sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() } })
+          @{source=$env:ARTMOTIFE_QUALIFICATION_SOURCE_COMMIT;runId=$env:GITHUB_RUN_ID;assets=$items} | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 -LiteralPath (Join-Path $dist 'windows-core-file-qualification.json')
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qualified-core-windows
+          path: |
+            source/connector-app/dist/*.exe
+            source/connector-app/dist/*.blockmap
+            source/connector-app/dist/*.yml
+            source/connector-app/dist/*qualification.json
+            source/connector-app/dist/*-final-artifact.json*
+          if-no-files-found: error
+          retention-days: 7
+  publish-components:
+    needs: qualify-and-sign
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Hadipkmn/artmotife-private
+          ref: ${{ inputs.source_sha }}
+          ssh-key: ${{ secrets.ARTMOTIFE_PRIVATE_SOURCE_KEY }}
+          persist-credentials: false
+          path: source
+          sparse-checkout: connector-app
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-components-*
+          path: candidates
+      - name: Resolve portable package inputs
+        run: |
+          node <<'NODE'
+          const fs=require('node:fs'),path=require('node:path');
+          const entries=['windows'].map(label=>{
+            const directory=path.resolve('candidates/release-components-'+label);
+            const item=JSON.parse(fs.readFileSync(path.join(directory,'publication-entry.json')));
+            if(path.basename(item.manifest)!==item.manifest)throw new Error('Invalid manifest path');
+            return {...item,directory,manifest:path.join(directory,item.manifest)};
+          });
+          fs.writeFileSync('publication-inputs.json',JSON.stringify(entries));
+          NODE
+      - name: Verify assets and atomically promote component feeds
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node source/connector-app/publishComponentFeed.cjs publication-inputs.json --windows-only
+
