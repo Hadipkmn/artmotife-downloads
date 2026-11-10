@@ -50,21 +50,23 @@ jobs:
       - run: npm ci --prefix source/connector-app
       - run: npm run test:components --prefix source/connector-app
 
-      - name: Build through native release gates
-        working-directory: source/connector-app
-        run: npm run build:win -- --publish never
       - name: Complete Windows regression on the exact release source
         shell: pwsh
         run: |
           $fixtureTemp = (node -e "const fs=require('fs');console.log((fs.realpathSync.native||fs.realpathSync)(require('os').tmpdir()))").Trim()
           $env:TEMP = $fixtureTemp
           $env:TMP = $fixtureTemp
+          npm ci --omit=dev --include=optional --prefix source/connector
+          if ($LASTEXITCODE -ne 0) { throw 'Connector regression dependencies failed' }
           npm ci --omit=dev --ignore-scripts --prefix source/ui
           if ($LASTEXITCODE -ne 0) { throw 'Regression dependencies failed' }
           node --test source/connector/projectMetadataListsService.test.mjs
           if ($LASTEXITCODE -ne 0) { throw 'Project metadata regression failed' }
           npm test --prefix source/connector-app
           if ($LASTEXITCODE -ne 0) { throw 'Full Connector regression failed' }
+      - name: Build through native release gates
+        working-directory: source/connector-app
+        run: npm run build:win -- --publish never
       - name: Windows real installer and component qualification
         shell: pwsh
         env:
