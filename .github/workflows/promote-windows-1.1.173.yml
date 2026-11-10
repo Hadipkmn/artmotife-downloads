@@ -11,11 +11,11 @@ concurrency:
   group: connector-stable-core-promotion
   cancel-in-progress: false
 env:
-  QUALIFICATION_RUN: '42760808672'
-  QUALIFIED_SOURCE: c9b281dea30efc5c32b6cb413ef6e5546e556e51
+  QUALIFICATION_RUN: '42763877926'
+  QUALIFIED_SOURCE: fbb0569a2dcdd4ae8695ea7b3126967944345032
 jobs:
   publish:
-    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.id == 42760808672 && github.event.workflow_run.conclusion == 'success')
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.id == 42763877926 && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
