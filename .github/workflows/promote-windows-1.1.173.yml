@@ -1,0 +1,56 @@
+name: Promote qualified Windows Connector 1.1.173
+on:
+  workflow_run:
+    workflows: [Qualified Windows Connector release]
+    types: [completed]
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: write
+concurrency:
+  group: connector-stable-core-promotion
+  cancel-in-progress: false
+env:
+  QUALIFICATION_RUN: '42760097186'
+  QUALIFIED_SOURCE: c9b281dea30efc5c32b6cb413ef6e5546e556e51
+jobs:
+  publish:
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.id == 42760097186 && github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Verify exact Windows release qualification
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$QUALIFICATION_RUN")
+          jq -e '.conclusion == "success" and .status == "completed" and .head_branch == "main" and .path == ".github/workflows/windows-qualified-core.yml" and .event == "workflow_dispatch"' <<< "$run" >/dev/null
+          jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$QUALIFICATION_RUN/jobs")
+          jq -e '[.jobs[] | .name] | sort == ["publish-components","qualify-and-sign"]' <<< "$jobs" >/dev/null
+          jq -e 'all(.jobs[]; .conclusion == "success")' <<< "$jobs" >/dev/null
+      - uses: actions/checkout@v4
+        with:
+          repository: Hadipkmn/artmotife-private
+          ref: f4dab0f04bc009bdf44b93419648c65caee22eef
+          ssh-key: ${{ secrets.ARTMOTIFE_PRIVATE_SOURCE_KEY }}
+          persist-credentials: false
+          path: tooling
+          sparse-checkout: |
+            connector-app
+            scripts
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts --prefix tooling/connector-app
+      - run: node --test tooling/scripts/publish-windows-stable-core.test.mjs
+      - uses: actions/download-artifact@v4
+        with:
+          name: qualified-core-windows
+          run-id: ${{ env.QUALIFICATION_RUN }}
+          github-token: ${{ github.token }}
+          path: candidate
+      - name: Verify draft then advance Stable
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node tooling/scripts/publish-windows-stable-core.mjs candidate "$RUNNER_TEMP/windows-stable" "$QUALIFIED_SOURCE" "$QUALIFICATION_RUN"
