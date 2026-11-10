@@ -1,0 +1,58 @@
+name: Windows Stable runtime patch
+on:
+  workflow_dispatch:
+    inputs:
+      tooling_sha:
+        description: Reviewed private tooling commit
+        required: true
+permissions:
+  contents: write
+concurrency:
+  group: connector-component-release
+  cancel-in-progress: false
+jobs:
+  windows-runtime-patch:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Require main and an immutable tooling commit
+        shell: bash
+        env:
+          TOOLING: ${{ inputs.tooling_sha }}
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          [[ "$TOOLING" =~ ^[a-f0-9]{40}$ ]]
+      - uses: actions/checkout@v4
+        with:
+          repository: Hadipkmn/artmotife-private
+          ref: ${{ inputs.tooling_sha }}
+          ssh-key: ${{ secrets.ARTMOTIFE_PRIVATE_SOURCE_KEY }}
+          persist-credentials: false
+          path: tooling
+          sparse-checkout: |
+            connector-app
+            scripts
+      - uses: actions/checkout@v4
+        with:
+          repository: Hadipkmn/artmotife-private
+          ref: d16c89de6a6cd44a8e5ab930f37572b468b50064
+          ssh-key: ${{ secrets.ARTMOTIFE_PRIVATE_SOURCE_KEY }}
+          persist-credentials: false
+          path: source
+          sparse-checkout: |
+            connector/postLtxChunkService.js
+            connector/postLtxJobService.js
+            connector/postLtxRuntimeService.js
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Verify component migration and publish only the signed Windows delta
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ARTMOTIFE_COMPONENT_SIGNING_KEY: ${{ secrets.ARTMOTIFE_COMPONENT_SIGNING_KEY }}
+        shell: pwsh
+        run: |
+          node --test tooling/connector-app/publishComponentFeed.test.cjs tooling/connector-app/componentPackageService.test.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node tooling/scripts/prepare-post-alpha-windows-patch.mjs publish source (Join-Path $env:RUNNER_TEMP 'alpha-windows-delta')
