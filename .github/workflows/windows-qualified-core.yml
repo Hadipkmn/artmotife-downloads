@@ -32,6 +32,7 @@ jobs:
           persist-credentials: false
           path: source
           sparse-checkout: |
+            .github/workflows
             connector-app
             connector
             ui/shared
