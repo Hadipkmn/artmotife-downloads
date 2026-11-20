@@ -1,0 +1,64 @@
+name: Qualified Windows ArtMix Atlas component
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: connector-component-release
+  cancel-in-progress: false
+
+jobs:
+  publish-windows-artmix-atlas:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Require the default release branch
+        shell: pwsh
+        run: if ($env:GITHUB_REF -ne 'refs/heads/main') { throw 'Dispatch from main' }
+      - name: Check out the reviewed release tooling
+        uses: actions/checkout@v4
+        with:
+          repository: Hadipkmn/artmotife-private
+          ref: e3a1a37758bb8d55b8d66f672ec3df7995f73c81
+          ssh-key: ${{ secrets.ARTMOTIFE_PRIVATE_SOURCE_KEY }}
+          persist-credentials: false
+          path: tooling
+          sparse-checkout: |
+            connector-app
+            scripts
+      - name: Check out the exact qualified ArtMix source
+        uses: actions/checkout@v4
+        with:
+          repository: Hadipkmn/artmotife-private
+          ref: 441e48fb057d370d51228f5a803ed68bdcb57e9f
+          ssh-key: ${{ secrets.ARTMOTIFE_PRIVATE_SOURCE_KEY }}
+          persist-credentials: false
+          path: source
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            connector/server.js
+            connector/artMixAssetFileService.js
+            connector/artMixAtlasDossierService.js
+            connector/flowAssetTaxonomyService.js
+            connector/imageModelTaxonomyService.js
+            connector/nextImageModelContractService.js
+            connector/productDossierGeminiEnvelopeService.js
+            ui/shared/artMixAssetTaxonomy.js
+            ui/shared/artMixLabels.js
+      - name: Match the qualified archive encoder
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.20.0
+      - name: Run the component publisher integrity and concurrency checks
+        run: node --test tooling/connector-app/publishComponentFeed.test.cjs tooling/connector-app/componentPackageService.test.cjs
+      - name: Reproduce and publish the byte-identical signed Windows component
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ARTMOTIFE_COMPONENT_SIGNING_KEY: ${{ secrets.ARTMOTIFE_COMPONENT_SIGNING_KEY }}
+        shell: pwsh
+        run: node tooling/scripts/prepare-artmix-windows-patch.cjs publish source (Join-Path $env:RUNNER_TEMP 'artmix-atlas-signed-release')
