@@ -13,6 +13,23 @@ on:
       tooling_sha:
         description: Exact reviewed release-tooling commit for qualified promotion
         required: false
+      windows_dev:
+        description: Promote the opt-in Windows DEV prerelease
+        type: boolean
+        default: false
+      dev_baseline_run_id:
+        description: Passing private Windows run for the existing DEV baseline
+        required: false
+      dev_baseline_sha:
+        description: Exact private source SHA of the DEV baseline
+        required: false
+      dev_publish:
+        description: Publish the qualified Windows DEV prerelease
+        type: boolean
+        default: false
+      dev_iteration:
+        description: Positive integer for the immutable Beta tag
+        required: false
   schedule:
     - cron: '17 */6 * * *'
 
@@ -28,8 +45,20 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  promote-windows-dev:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.windows_dev }}
+    uses: ./.github/workflows/promote-windows-dev.yml
+    with:
+      source_sha: ${{ inputs.source_ref }}
+      candidate_run_id: ${{ inputs.qualification_run_id }}
+      baseline_sha: ${{ inputs.dev_baseline_sha }}
+      baseline_run_id: ${{ inputs.dev_baseline_run_id }}
+      iteration: ${{ inputs.dev_iteration }}
+      publish: ${{ inputs.dev_publish }}
+    secrets: inherit
+
   promote-qualified:
-    if: ${{ inputs.qualification_run_id != '' }}
+    if: ${{ !inputs.windows_dev && inputs.qualification_run_id != '' }}
     uses: ./.github/workflows/promote-qualified-core.yml
     with:
       source_sha: ${{ inputs.source_ref }}
@@ -37,7 +66,7 @@ jobs:
       qualification_run_id: ${{ inputs.qualification_run_id }}
     secrets: inherit
   preflight:
-    if: ${{ !inputs.qualification_run_id }}
+    if: ${{ !inputs.windows_dev && !inputs.qualification_run_id }}
     runs-on: ubuntu-latest
     outputs:
       source_sha: ${{ steps.release.outputs.source_sha }}
