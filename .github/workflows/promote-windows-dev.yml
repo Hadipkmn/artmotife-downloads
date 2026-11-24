@@ -1,0 +1,124 @@
+name: Qualify and promote Windows DEV Connector
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        type: string
+        required: true
+      candidate_run_id:
+        type: string
+        required: true
+      baseline_sha:
+        type: string
+        required: true
+      baseline_run_id:
+        type: string
+        required: true
+      iteration:
+        type: string
+        required: true
+      publish:
+        type: boolean
+        default: false
+    secrets:
+      ARTMOTIFE_DEV_ARTIFACTS_READ_TOKEN:
+        required: true
+permissions:
+  actions: read
+  contents: read
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SOURCE: ${{ inputs.source_sha }}
+      BASELINE: ${{ inputs.baseline_sha }}
+      CANDIDATE_RUN: ${{ inputs.candidate_run_id }}
+      BASELINE_RUN: ${{ inputs.baseline_run_id }}
+      ITERATION: ${{ inputs.iteration }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Require exact successful private Windows runs
+        env:
+          GH_TOKEN: ${{ secrets.ARTMOTIFE_DEV_ARTIFACTS_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE" =~ ^[a-f0-9]{40}$ && "$BASELINE" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$CANDIDATE_RUN" =~ ^[0-9]+$ && "$BASELINE_RUN" =~ ^[0-9]+$ && "$ITERATION" =~ ^[1-9][0-9]{0,3}$ ]]
+          [[ "$CANDIDATE_RUN" != "$BASELINE_RUN" && "$SOURCE" != "$BASELINE" ]]
+          repo=Hadipkmn/artmotife-private
+          published_source=$(gh api "repos/$repo/compare/$SOURCE...main" --jq .merge_base_commit.sha)
+          [[ "$published_source" == "$SOURCE" ]]
+          check_run() {
+            local run="$1"
+            gh api "repos/$repo/actions/runs/$run" |
+              jq -er '. | select(.status == "completed" and .conclusion == "success" and .event == "workflow_dispatch" and .path == ".github/workflows/connector-component-native-candidate.yml") | .head_sha | select(test("^[a-f0-9]{40}$"))'
+          }
+          baseline_tooling=$(check_run "$BASELINE_RUN")
+          echo "BASELINE_TOOLING=$baseline_tooling" >> "$GITHUB_ENV"
+          candidate_tooling=$(check_run "$CANDIDATE_RUN")
+          echo "CANDIDATE_TOOLING=$candidate_tooling" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          repository: Hadipkmn/artmotife-private
+          name: connector-component-candidate-windows
+          run-id: ${{ inputs.baseline_run_id }}
+          github-token: ${{ secrets.ARTMOTIFE_DEV_ARTIFACTS_READ_TOKEN }}
+          path: baseline
+      - uses: actions/download-artifact@v4
+        with:
+          repository: Hadipkmn/artmotife-private
+          name: connector-component-candidate-windows
+          run-id: ${{ inputs.candidate_run_id }}
+          github-token: ${{ secrets.ARTMOTIFE_DEV_ARTIFACTS_READ_TOKEN }}
+          path: candidate
+      - name: Verify metadata, evidence and differential transfer
+        run: |
+          node --test scripts/qualify-windows-dev.test.mjs
+          node scripts/qualify-windows-dev.mjs baseline candidate release "$BASELINE" "$SOURCE" "$ITERATION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qualified-windows-dev
+          path: release
+          if-no-files-found: error
+          retention-days: 7
+  publish:
+    if: inputs.publish && github.ref == 'refs/heads/main'
+    needs: qualify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: qualified-windows-dev
+          path: release
+      - name: Verify draft and publish as a prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd release
+          tag=$(jq -r .tag dev-qualification.json)
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[1-9][0-9]*$ ]]
+          stable_before=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .id)
+          draft=$(gh api --method POST "repos/$GITHUB_REPOSITORY/releases" -f tag_name="$tag" -f target_commitish="$GITHUB_SHA" -f name="Windows Connector DEV $tag" -F prerelease=true -F draft=true -f make_latest=false -f body='Windows-only DEV prerelease. Small transfers require a cached previous installer. The full installer is the updater fallback.')
+          id=$(jq -er '.id' <<< "$draft")
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" ./*.exe ./*.blockmap ./beta.yml ./dev-qualification.json
+          remote=$(gh api "repos/$GITHUB_REPOSITORY/releases/$id")
+          jq -e --arg tag "$tag" '.draft and .prerelease and .tag_name == $tag and (.assets | length == 5)' <<< "$remote" >/dev/null
+          for file in ./*.exe ./*.blockmap ./beta.yml ./dev-qualification.json; do
+            checksum=$(sha256sum "$file" | cut -d ' ' -f 1)
+            bytes=$(stat -c '%s' "$file")
+            jq -e --arg name "${file#./}" --arg digest "sha256:$checksum" --argjson bytes "$bytes" 'any(.assets[]; .name == $name and .digest == $digest and .size == $bytes and .state == "uploaded")' <<< "$remote" >/dev/null
+          done
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$id" -F prerelease=true -F draft=false -f make_latest=false --jq .html_url
+          stable_after=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .id)
+          [[ "$stable_before" == "$stable_after" ]]
