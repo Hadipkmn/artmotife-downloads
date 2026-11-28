@@ -13,6 +13,12 @@ on:
       tooling_sha:
         description: Exact reviewed release-tooling commit for qualified promotion
         required: false
+      windows_baseline_tag:
+        description: Previous Stable Windows tag to retain; set only for Windows-only promotion
+        required: false
+      windows_qualification_workflow_sha:
+        description: Exact downloads-repo main commit used by the successful Windows qualification
+        required: false
   schedule:
     - cron: '17 */6 * * *'
 
@@ -29,15 +35,72 @@ concurrency:
 
 jobs:
   promote-qualified:
-    if: ${{ inputs.qualification_run_id != '' }}
+    if: ${{ inputs.qualification_run_id != '' && !inputs.windows_baseline_tag && !inputs.windows_qualification_workflow_sha }}
     uses: ./.github/workflows/promote-qualified-core.yml
     with:
       source_sha: ${{ inputs.source_ref }}
       tooling_sha: ${{ inputs.tooling_sha }}
       qualification_run_id: ${{ inputs.qualification_run_id }}
     secrets: inherit
+  promote-qualified-windows:
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.windows_baseline_tag != '' || inputs.windows_qualification_workflow_sha != '') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      QUALIFIED_SOURCE: ${{ inputs.source_ref }}
+      QUALIFICATION_RUN: ${{ inputs.qualification_run_id }}
+      QUALIFICATION_WORKFLOW_SHA: ${{ inputs.windows_qualification_workflow_sha }}
+      WINDOWS_BASELINE_TAG: ${{ inputs.windows_baseline_tag }}
+      TOOLING_SHA: ${{ inputs.tooling_sha }}
+    steps:
+      - name: Require the exact successful official Windows qualification
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == refs/heads/main && "$GITHUB_REPOSITORY" == Hadipkmn/artmotife-downloads ]]
+          [[ "$QUALIFIED_SOURCE" =~ ^[a-f0-9]{40}$ && "$TOOLING_SHA" == "$QUALIFIED_SOURCE" ]]
+          [[ "$QUALIFICATION_WORKFLOW_SHA" =~ ^[a-f0-9]{40}$ && "$QUALIFICATION_RUN" =~ ^[1-9][0-9]{0,15}$ ]]
+          [[ "$WINDOWS_BASELINE_TAG" =~ ^connector-v1\.1\.[0-9]+-windows-x64$ ]]
+          run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$QUALIFICATION_RUN")
+          jq -e --arg sha "$QUALIFICATION_WORKFLOW_SHA" '.conclusion == "success" and .status == "completed" and .head_branch == "main" and .head_sha == $sha and .path == ".github/workflows/windows-qualified-core.yml" and .event == "workflow_dispatch"' <<< "$run" >/dev/null
+          jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$QUALIFICATION_RUN/jobs")
+          jq -e '([.jobs[] | .name] | sort) == ["publish-components","qualify-and-sign"] and all(.jobs[]; .conclusion == "success")' <<< "$jobs" >/dev/null
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$QUALIFICATION_RUN/artifacts" --jq '.artifacts | map(select(.name == "qualified-core-windows" and .expired == false)) | length' | grep -x 1 >/dev/null
+      - uses: actions/checkout@v4
+        with:
+          repository: Hadipkmn/artmotife-private
+          ref: main
+          ssh-key: ${{ secrets.ARTMOTIFE_PRIVATE_SOURCE_KEY }}
+          persist-credentials: false
+          path: tooling
+          sparse-checkout: |
+            connector-app
+            scripts
+      - name: Verify reviewed private source is still current main
+        run: test "$(git -C tooling rev-parse HEAD)" = "$QUALIFIED_SOURCE"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts --prefix tooling/connector-app
+      - run: node --test tooling/scripts/publish-windows-stable-core.test.mjs
+      - uses: actions/download-artifact@v4
+        with:
+          name: qualified-core-windows
+          run-id: ${{ inputs.qualification_run_id }}
+          github-token: ${{ github.token }}
+          path: candidate
+      - name: Verify all draft assets before advancing Windows Stable
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./tooling/connector-app/package.json').version")
+          node tooling/scripts/publish-windows-stable-core.mjs candidate "$RUNNER_TEMP/windows-stable" "$QUALIFIED_SOURCE" "$QUALIFICATION_RUN" "$version" "$WINDOWS_BASELINE_TAG"
   preflight:
-    if: ${{ !inputs.qualification_run_id }}
+    if: ${{ !inputs.qualification_run_id && !inputs.windows_baseline_tag && !inputs.windows_qualification_workflow_sha }}
     runs-on: ubuntu-latest
     outputs:
       source_sha: ${{ steps.release.outputs.source_sha }}
